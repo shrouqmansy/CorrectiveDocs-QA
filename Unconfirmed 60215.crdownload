@@ -1,0 +1,270 @@
+"""Standalone Gradio app for the Corrective RAG system.
+
+Usage:
+    export GROQ_API_KEY="your_key"
+    python app.py
+"""
+import os
+import re
+import glob
+import time
+import getpass
+import pandas as pd
+import chromadb
+import gradio as gr
+from pypdf import PdfReader
+from docx import Document
+from groq import Groq
+from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer, CrossEncoder
+
+# settings
+chunk_size = 700
+table_chunk_size = 1200
+candidates = 15
+rerank_keep = 6
+embed_model_name = 'BAAI/bge-base-en-v1.5'
+rerank_model_name = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
+llm_model = 'openai/gpt-oss-120b'
+query_prefix = 'Represent this sentence for searching relevant passages: '
+no_answer = 'I could not find the answer in the documents.'
+data_folder = os.environ.get('DATA_FOLDER', 'novatech_data')
+
+
+# reading files
+def read_pdf(path):
+    reader = PdfReader(path)
+    return '\n'.join(page.extract_text() or '' for page in reader.pages)
+
+
+def read_docx(path):
+    doc = Document(path)
+    lines = []
+    for p in doc.paragraphs:
+        if not p.text.strip():
+            continue
+        if p.style.name.startswith('Heading'):
+            lines.append('# ' + p.text.strip())
+        else:
+            lines.append(p.text.strip())
+    return '\n'.join(lines)
+
+
+def read_txt(path):
+    with open(path, encoding='utf-8') as file:
+        return file.read()
+
+
+def read_csv(path):
+    df = pd.read_csv(path, dtype=str)
+    rows = []
+    for _, row in df.iterrows():
+        rows.append('; '.join([col + ': ' + row[col] for col in df.columns if pd.notna(row[col])]) + '.')
+    return '\n'.join(rows)
+
+
+def clean_text(text):
+    text = text.replace('\r', '')
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+readers = {'pdf': read_pdf, 'docx': read_docx, 'txt': read_txt, 'csv': read_csv}
+
+
+# chunking
+def is_heading(line):
+    line = line.strip()
+    if line.startswith('# ') or line.startswith('Q:'):
+        return True
+    return bool(re.match(r'^\d+\.\s', line)) and len(line) < 60
+
+
+def split_sections(text):
+    sections = []
+    title = 'Introduction'
+    body = []
+    for line in text.split('\n'):
+        if not line.strip():
+            continue
+        if is_heading(line):
+            if body:
+                sections.append((title, ' '.join(body)))
+            title = line.strip().lstrip('# ').strip()
+            body = []
+        else:
+            body.append(line.strip())
+    if body:
+        sections.append((title, ' '.join(body)))
+    return sections
+
+
+def split_long(body, size):
+    sentences = re.split(r'(?<=[.!?])\s+', body)
+    pieces = []
+    current = ''
+    for s in sentences:
+        if current and len(current) + len(s) > size:
+            pieces.append(current)
+            current = s
+        else:
+            current = current + ' ' + s if current else s
+    if current:
+        pieces.append(current)
+    return pieces
+
+
+def make_chunks(doc):
+    result = []
+    if doc['type'] == 'csv':
+        current = ''
+        for row in doc['text'].split('\n'):
+            if current and len(current) + len(row) > table_chunk_size:
+                result.append(('Table', current))
+                current = row
+            else:
+                current = current + '\n' + row if current else row
+        if current:
+            result.append(('Table', current))
+        return result
+    for title, body in split_sections(doc['text']):
+        if len(body) < 40:
+            continue
+        for piece in split_long(body, chunk_size):
+            result.append((title, piece))
+    return result
+
+
+# build the knowledge base
+if not os.path.exists(data_folder):
+    raise FileNotFoundError('Folder ' + data_folder + ' not found. Put the documents in it or set DATA_FOLDER.')
+
+file_paths = sorted([p for p in glob.glob(data_folder + '/**/*.*', recursive=True) if p.lower().endswith(('.pdf', '.docx', '.txt', '.csv')) and 'eval_questions' not in p])
+
+documents = []
+for path in file_paths:
+    extension = path.split('.')[-1].lower()
+    text = clean_text(readers[extension](path))
+    documents.append({'source': os.path.basename(path), 'type': extension, 'text': text})
+
+chunks = []
+for doc in documents:
+    for title, piece in make_chunks(doc):
+        text = 'Source: ' + doc['source'] + '\nSection: ' + title + '\n' + piece
+        chunks.append({'id': str(len(chunks)), 'text': text, 'source': doc['source'], 'section': title})
+
+print(len(documents), 'files,', len(chunks), 'chunks')
+
+embedder = SentenceTransformer(embed_model_name)
+reranker = CrossEncoder(rerank_model_name)
+texts = [c['text'] for c in chunks]
+embeddings = embedder.encode(texts, batch_size=32, normalize_embeddings=True)
+
+client = chromadb.Client()
+collection = client.create_collection('docs')
+collection.add(ids=[c['id'] for c in chunks], documents=texts, embeddings=embeddings.tolist(), metadatas=[{'source': c['source'], 'section': c['section']} for c in chunks])
+
+
+def tokenize(text):
+    return re.findall(r'[a-z0-9]+', text.lower())
+
+
+bm25 = BM25Okapi([tokenize(t) for t in texts])
+llm = Groq(api_key=os.environ.get('GROQ_API_KEY') or getpass.getpass('Groq API key: '))
+
+
+# retrieval
+def retrieve(query):
+    query_vector = embedder.encode(query_prefix + query, normalize_embeddings=True).tolist()
+    dense = collection.query(query_embeddings=[query_vector], n_results=min(candidates, len(chunks)))
+    dense_ids = [int(i) for i in dense['ids'][0]]
+    scores = bm25.get_scores(tokenize(query))
+    keyword_ids = [i for i in sorted(range(len(chunks)), key=lambda i: scores[i], reverse=True)[:candidates] if scores[i] > 0]
+    fused = {}
+    for ranking in [dense_ids, keyword_ids]:
+        for rank, i in enumerate(ranking):
+            fused[i] = fused.get(i, 0) + 1 / (60 + rank)
+    best = sorted(fused, key=fused.get, reverse=True)[:candidates]
+    rerank_scores = reranker.predict([[query, chunks[i]['text']] for i in best])
+    ranked = sorted(zip(rerank_scores, best), key=lambda x: x[0], reverse=True)
+    return [{'score': float(s), 'index': i, 'text': chunks[i]['text'], 'source': chunks[i]['source'], 'section': chunks[i]['section']} for s, i in ranked[:rerank_keep]]
+
+
+# llm steps
+def ask_llm(system, user):
+    for attempt in range(5):
+        try:
+            response = llm.chat.completions.create(model=llm_model, messages=[{'role': 'system', 'content': system}, {'role': 'user', 'content': user}], temperature=0, max_tokens=2000)
+            return (response.choices[0].message.content or '').strip()
+        except Exception as error:
+            print('llm error, trying again:', str(error)[:100])
+            time.sleep(20)
+    return ''
+
+
+def grade_chunks(question, hits):
+    passages = '\n\n'.join(['[' + str(i + 1) + '] ' + h['text'] for i, h in enumerate(hits)])
+    system = 'You check retrieved passages for a question answering system. A passage is relevant if it contains facts that help answer the question, even if it uses different words than the question (for example vacation and annual leave mean the same thing). Reply with only the numbers of the relevant passages separated by commas. If no passage helps, reply with only the word NONE.'
+    reply = ask_llm(system, 'Question: ' + question + '\n\nPassages:\n' + passages)
+    numbers = sorted(set([int(n) for n in re.findall(r'\d+', reply)]))
+    return [hits[n - 1] for n in numbers if 1 <= n <= len(hits)]
+
+
+def rewrite_query(question):
+    system = 'You help a search system. The first search for the question found nothing useful. Write 3 different search queries that could find the answer in company documents. Use other words the documents might use, such as synonyms, formal terms and related terms. Write one query per line with no numbering and no extra text.'
+    reply = ask_llm(system, 'Question: ' + question)
+    lines = [re.sub(r'^\s*(\d+[.)]|[-*])\s*', '', l).strip() for l in reply.split('\n') if l.strip()]
+    return lines[:3]
+
+
+def generate_answer(question, good):
+    context = '\n\n'.join(['[' + str(i + 1) + '] ' + h['text'] for i, h in enumerate(good)])
+    system = 'You answer questions about a company using only the context given. Match by meaning, not only by exact words. Give a short and direct answer and keep the exact numbers, dates and names from the context. If the context does not contain the answer, reply exactly: ' + no_answer + ' Never use outside knowledge and never mention passage numbers.'
+    return ask_llm(system, 'Context:\n' + context + '\n\nQuestion: ' + question)
+
+
+def search_again(question, hits):
+    new_queries = rewrite_query(question)
+    pool = {}
+    for q in new_queries:
+        for h in retrieve(q):
+            if h['index'] not in pool or h['score'] > pool[h['index']]['score']:
+                pool[h['index']] = h
+    for h in hits:
+        pool.setdefault(h['index'], h)
+    merged = sorted(pool.values(), key=lambda h: h['score'], reverse=True)[:rerank_keep + 2]
+    return grade_chunks(question, merged), new_queries
+
+
+def corrective_answer(question):
+    hits = retrieve(question)
+    good = grade_chunks(question, hits)
+    new_queries = []
+    answer = ''
+    if good:
+        answer = generate_answer(question, good)
+    if not good or 'could not find' in answer.lower():
+        good, new_queries = search_again(question, hits)
+        answer = generate_answer(question, good) if good else ''
+    if not good or not answer or 'could not find' in answer.lower():
+        return {'answer': no_answer, 'sources': [], 'rewritten': new_queries, 'good': len(good)}
+    sources = sorted(set([h['source'] + ' / ' + h['section'] for h in good]))
+    return {'answer': answer, 'sources': sources, 'rewritten': new_queries, 'good': len(good)}
+
+
+# gradio app
+def chat(question):
+    if not question.strip():
+        return 'Please type a question.', '', ''
+    result = corrective_answer(question)
+    steps = 'Relevant passages found: ' + str(result['good'])
+    if result['rewritten']:
+        steps += '\nFirst search was weak, rewritten as:\n' + '\n'.join(result['rewritten'])
+    return result['answer'], '\n'.join(result['sources']), steps
+
+
+demo = gr.Interface(fn=chat, inputs=[gr.Textbox(label='Your question', lines=2)], outputs=[gr.Markdown(label='Answer'), gr.Textbox(label='Sources'), gr.Textbox(label='Process', lines=4)], title='Corrective RAG Assistant', description='Ask a question about the company documents.')
+
+if __name__ == '__main__':
+    demo.launch()

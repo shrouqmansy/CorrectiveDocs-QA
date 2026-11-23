@@ -1,0 +1,27 @@
+id,question,type,expected_source,expected_keywords
+1,How many days of annual leave do employees get per year?,direct,HR_policy.pdf,21
+2,How long is the probation period?,direct,HR_policy.pdf,3months|threemonths
+3,What is the minimum password length for employees?,direct,IT_security_policy.txt,14
+4,How long is the free trial of NovaDesk?,direct,Support_FAQ.txt,14days|14-day
+5,What is the price of the Business plan per agent per month?,direct,Pricing.csv,39
+6,What API rate limit does the Enterprise plan have?,direct,Pricing.csv|Product_guide.pdf,2000
+7,Who is the head of the Human Resources department?,direct,Offices_directory.csv,salmafarouk
+8,How many days of maternity leave are given?,direct,HR_policy.pdf,90
+9,What is the daily meal limit during business travel?,direct,Employee_handbook.docx,300
+10,Within how many days can a customer get a full refund?,direct,Support_FAQ.txt,30
+11,How many vacation days do I get?,needs_rewrite,HR_policy.pdf,21
+12,How do I ask for time off?,needs_rewrite,Employee_handbook.docx,hrconnect
+13,What happens if my work laptop gets stolen?,needs_rewrite,IT_security_policy.txt,2hours
+14,Can I work from home?,needs_rewrite,HR_policy.pdf,2days|twodays
+15,How much does the cheapest plan cost?,needs_rewrite,Pricing.csv,15
+16,How long must I give notice before quitting my job?,needs_rewrite,HR_policy.pdf,60days
+17,Does the software work on Internet Explorer?,needs_rewrite,Product_guide.pdf,notsupport|nosupport|doesnotsupport|unsupported
+18,When do I get my pay each month?,needs_rewrite,Employee_handbook.docx,25th|25
+19,Can I plug a flash drive into my work computer?,needs_rewrite,IT_security_policy.txt,blocked|ciso
+20,When are performance evaluations done?,needs_rewrite,Employee_handbook.docx,june
+21,Is NovaDesk HIPAA compliant?,unanswerable,,couldnotfind
+22,What is the CEO's salary?,unanswerable,,couldnotfind
+23,Does NovaTech have an office in Dubai?,unanswerable,,couldnotfind
+24,What is the stock option plan for employees?,unanswerable,,couldnotfind
+25,Does NovaDesk offer a WhatsApp integration?,unanswerable,,couldnotfind
+26,What was the company revenue last year?,unanswerable,,couldnotfind
